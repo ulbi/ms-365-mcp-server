@@ -113,6 +113,8 @@ class GraphClient {
     try {
       const response = await this.performRequest(endpoint, accessToken, options);
 
+      logger.debug(`[GRAPH CLIENT] Response status: ${response.status} ${response.statusText}`);
+
       if (response.status === 403) {
         const errorText = await response.text();
         if (errorText.includes('scope') || errorText.includes('permission')) {
@@ -150,9 +152,11 @@ class GraphClient {
           contentBytes: buffer.toString('base64'),
         };
       } else {
-        const text = await response.text();
+const text = await response.text();
 
-        if (text === '') {
+      logger.debug(`[GRAPH CLIENT] Raw response for ${endpoint}: ${text.slice(0, 2000)}`);
+
+      if (text === '') {
           result = { message: 'OK!' };
         } else if (options.rawResponse) {
           // download-bytes on /content wants the body verbatim. A JSON body
@@ -277,6 +281,9 @@ class GraphClient {
       'Content-Type': 'application/json',
       ...options.headers,
     };
+
+    logger.debug(`[GRAPH CLIENT] Request: ${options.method || 'GET'} ${url}`);
+    logger.debug(`[GRAPH CLIENT] Request headers: ${JSON.stringify({ ...headers, Authorization: 'Bearer [REDACTED]' })}`);
 
     return fetchWithResilience(
       url,
