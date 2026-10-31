@@ -11,7 +11,10 @@ import { deriveTargetResource, type AuditTargetResource } from './audit-target-r
 import AuthManager, {
   getEndpointScopeGroups,
   getMissingAllowedScopesForGroups,
+  isEndpointInScopeMode,
   parseAllowedScopes,
+  scopeModeFor,
+  type ScopeMode,
 } from './auth.js';
 import { api as betaApi } from './generated/client-beta.js';
 import { api } from './generated/client.js';
@@ -98,6 +101,7 @@ interface EndpointConfig {
   toolName: string;
   scopes?: string[] | string[][];
   workScopes?: string[] | string[][];
+  appScopes?: string[] | string[][];
   apiVersion?: string; // Graph API version ('v1.0' default, or 'beta'). Selects spec + URL prefix.
   returnDownloadUrl?: boolean;
   supportsTimezone?: boolean;
@@ -980,6 +984,19 @@ interface UtilityTool {
   stdioOnly?: boolean;
   // Registered only while this returns true, for a tool that needs operator opt-in.
   enabled?: () => boolean;
+  // Works only on the signed-in user's own /me paths, so it is hidden in --app-mode.
+  meOnly?: boolean;
+}
+
+export function isUtilityToolAvailable(
+  utility: UtilityTool,
+  options: { readOnly: boolean; httpMode: boolean; scopeMode: ScopeMode }
+): boolean {
+  if (options.readOnly && !utility.readOnlyHint) return false;
+  if (options.httpMode && utility.stdioOnly) return false;
+  if (options.scopeMode === 'app' && utility.meOnly) return false;
+  if (utility.enabled && !utility.enabled()) return false;
+  return true;
 }
 
 interface DisabledToolScope {
@@ -1021,7 +1038,7 @@ function deniedToolPolicyForGraphTool(
 
 function collectDeniedToolPolicies(options: {
   readOnly: boolean;
-  orgMode: boolean;
+  scopeMode: ScopeMode;
   enabledToolsRegex?: RegExp;
   allowedScopesValue?: string;
   httpMode: boolean;
@@ -1031,7 +1048,7 @@ function collectDeniedToolPolicies(options: {
 
   for (const tool of allEndpoints) {
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
-    if (!options.orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
+    if (!isEndpointInScopeMode(endpointConfig, options.scopeMode)) {
       continue;
     }
 
@@ -1052,7 +1069,7 @@ function collectDeniedToolPolicies(options: {
       allowedScopes !== undefined && !endpointConfig
         ? ['endpoint scope metadata']
         : getMissingAllowedScopesForGroups(
-            getEndpointScopeGroups(endpointConfig, options.orgMode),
+            getEndpointScopeGroups(endpointConfig, options.scopeMode),
             allowedScopes
           );
     if (missingScopes.length > 0) {
@@ -1064,9 +1081,7 @@ function collectDeniedToolPolicies(options: {
   }
 
   for (const utility of UTILITY_TOOLS) {
-    if (options.readOnly && !utility.readOnlyHint) continue;
-    if (options.httpMode && utility.stdioOnly) continue;
-    if (utility.enabled && !utility.enabled()) continue;
+    if (!isUtilityToolAvailable(utility, options)) continue;
     if (options.enabledToolsRegex && !options.enabledToolsRegex.test(utility.name)) {
       deniedTools.set(utility.name, {
         toolName: utility.name,
@@ -1176,9 +1191,19 @@ async function checkAccountParamInBearerMode(
  */
 const UPLOAD_TARGET = /^(\/me|\/users\/[^/]+)\/(messages|events)\/[^/]+\/attachments$/;
 const UPLOAD_CONTENT_TYPE = /^[\w.+-]+\/[\w.+-]+$/;
+/** Content-ID of an inline attachment: what the body references as cid:<contentId>. */
+const UPLOAD_CONTENT_ID = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,99}$/;
+const UPLOAD_CONTENT_ID_ERROR =
+  'contentId may hold letters, digits, ".", "_", "@" and "-" (at most 100), e.g. signature-photo.';
+const contentIdSchema = z
+  .string()
+  .optional()
+  .describe(
+    'Attach inline under this Content-ID instead of as a regular attachment, so the HTML body can show the file with <img src="cid:<contentId>">, e.g. a picture in an email signature. Letters, digits, ".", "_", "@", "-".'
+  );
 
 const UPLOAD_TARGET_ERROR =
-  'target must be the attachments collection of a draft message or an event: /me/messages/{message-id}/attachments or /me/events/{event-id}/attachments.';
+  'target must be the attachments collection of a draft message or an event: /me/messages/{message-id}/attachments or /me/events/{event-id}/attachments (or /users/{user-id}/... for another mailbox).';
 
 function uploadError(message: string): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify({ error: message }) }], isError: true };
@@ -1194,6 +1219,11 @@ function cleanAttachmentName(name: string): string {
     .slice(0, 255);
 }
 
+/** An empty or non-string contentId means a regular attachment. */
+function optionalContentId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
 /**
  * Mint an upload ticket for `target`, the `/attachments` collection of a draft
  * message or an event, redeemed by one PUT of the file bytes. Same identity
@@ -1205,7 +1235,8 @@ async function mintUploadUrl(
   name: string,
   contentType: string,
   accountParam: string | undefined,
-  authManager: AuthManager | undefined
+  authManager: AuthManager | undefined,
+  contentId?: string
 ): Promise<CallToolResult> {
   const minting = getAttachmentMinting();
   if (!minting) {
@@ -1226,6 +1257,9 @@ async function mintUploadUrl(
   if (!UPLOAD_CONTENT_TYPE.test(contentType)) {
     return uploadError('contentType must be a MIME type such as application/pdf.');
   }
+  if (contentId !== undefined && !UPLOAD_CONTENT_ID.test(contentId)) {
+    return uploadError(UPLOAD_CONTENT_ID_ERROR);
+  }
 
   const identityFromRequest = Boolean(authManager?.isOAuthModeEnabled() || getRequestTokens());
   const requestToken = identityFromRequest
@@ -1243,7 +1277,7 @@ async function mintUploadUrl(
 
   let ticket: { id: string; expiresAtMs: number };
   try {
-    const upload = { name: cleanName, contentType };
+    const upload = { name: cleanName, contentType, ...(contentId ? { contentId } : {}) };
     ticket = requestToken
       ? minting.store.mintUploadWithToken(target, requestToken, upload)
       : minting.store.mintUpload(target, accountParam, upload);
@@ -1420,7 +1454,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     searchKeywords:
       'upload attachment attach file draft email attach file event large attachment send file out-of-band upload url',
     description:
-      'Mint a short-lived, single-use URL that this server serves for uploading a file as an attachment to a draft message or an event, so the bytes go straight from the caller to Microsoft Graph instead of passing as base64 through the agent context. target is the attachments collection of the item: /me/messages/{message-id}/attachments (a draft; create it first) or /me/events/{event-id}/attachments. PUT the raw file bytes to the returned uploadUrl with a Content-Length (e.g. curl -T file "<uploadUrl>"); the response confirms the attachment. Files under 3 MB are attached directly, larger ones (up to 150 MB) through a Graph upload session. Requires --enable-attachment-urls. Returns { uploadUrl, method, expiresAt, singleUse, maxBytes }.',
+      'Mint a short-lived, single-use URL that this server serves for uploading a file as an attachment to a draft message or an event, so the bytes go straight from the caller to Microsoft Graph instead of passing as base64 through the agent context. target is the attachments collection of the item: /me/messages/{message-id}/attachments (a draft; create it first) or /me/events/{event-id}/attachments. PUT the raw file bytes to the returned uploadUrl with a Content-Length (e.g. curl -T file "<uploadUrl>"); the response confirms the attachment. Files under 3 MB are attached directly, larger ones (up to 150 MB) through a Graph upload session. Pass contentId to attach inline, e.g. a signature picture the HTML body shows with <img src="cid:<contentId>">. Requires --enable-attachment-urls. Returns { uploadUrl, method, expiresAt, singleUse, maxBytes }.',
     readOnlyHint: false,
     openWorldHint: true,
     buildSchema: (ctx) => {
@@ -1428,7 +1462,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         target: z
           .string()
           .describe(
-            'Attachments collection of a draft message or an event, e.g. /me/messages/{message-id}/attachments or /me/events/{event-id}/attachments.'
+            'Attachments collection of a draft message or an event, e.g. /me/messages/{message-id}/attachments, /me/events/{event-id}/attachments, or /users/{user-id}/messages/{message-id}/attachments for another mailbox.'
           ),
         name: z
           .string()
@@ -1439,6 +1473,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           .describe(
             'MIME type of the file, e.g. application/pdf. Defaults to application/octet-stream.'
           ),
+        contentId: contentIdSchema,
       };
       if (ctx.multiAccount) {
         schema['account'] = z
@@ -1468,7 +1503,8 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         name,
         contentType,
         params.account as string | undefined,
-        authManager
+        authManager,
+        optionalContentId(params.contentId)
       );
     },
   },
@@ -1489,7 +1525,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         target: z
           .string()
           .describe(
-            'Attachments collection of a draft message or an event, e.g. /me/messages/{message-id}/attachments or /me/events/{event-id}/attachments.'
+            'Attachments collection of a draft message or an event, e.g. /me/messages/{message-id}/attachments, /me/events/{event-id}/attachments, or /users/{user-id}/messages/{message-id}/attachments for another mailbox.'
           ),
         filePath: z
           .string()
@@ -1508,6 +1544,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           .describe(
             'MIME type of the file, e.g. application/pdf. Defaults to application/octet-stream.'
           ),
+        contentId: contentIdSchema,
       };
       if (ctx.multiAccount) {
         schema['account'] = z
@@ -1539,6 +1576,10 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       if (!UPLOAD_CONTENT_TYPE.test(contentType)) {
         return uploadError('contentType must be a MIME type such as application/pdf.');
       }
+      const contentId = optionalContentId(params.contentId);
+      if (contentId !== undefined && !UPLOAD_CONTENT_ID.test(contentId)) {
+        return uploadError(UPLOAD_CONTENT_ID_ERROR);
+      }
       const name = cleanAttachmentName(
         typeof params.name === 'string' && params.name.trim().length > 0
           ? params.name
@@ -1567,7 +1608,14 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         }
         const created = await uploadAttachment(
           graphClient,
-          { target, name, contentType, size: file.size, accessToken: accountAccessToken },
+          {
+            target,
+            name,
+            contentType,
+            size: file.size,
+            accessToken: accountAccessToken,
+            contentId,
+          },
           // end pins the read to the size that was declared, should the file grow meanwhile
           file.handle.createReadStream({
             autoClose: false,
@@ -1630,6 +1678,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
   },
   {
     name: 'read-mail-text',
+    meOnly: true,
     method: 'GET',
     path: 'tool:read-mail-text',
     searchKeywords:
@@ -1832,10 +1881,10 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           ),
         fileName: z
           .string()
+          .optional()
           .describe(
             'Name of the file, used as the last segment of the returned resource URI when the server runs with blob output. Optional.'
-          )
-          .optional(),
+          ),
       };
       if (ctx.multiAccount) {
         schema['account'] = z
@@ -2412,37 +2461,48 @@ function namesNestedBodyType(value: unknown): boolean {
 }
 
 // Dig out the object shape of a Body schema so flattened top-level params can be
-// matched against it (#569). z.lazy (chatMessage etc.) hides it behind _def.getter
+// matched against it (#569). z.lazy (chatMessage etc.) hides it behind def.getter
 function bodySchemaShape(schema: z.ZodTypeAny | undefined): Record<string, unknown> | null {
   let current: z.ZodTypeAny | undefined = schema;
   for (let i = 0; i < 10 && current; i++) {
     if (current instanceof z.ZodObject) {
       return current.shape as Record<string, unknown>;
     }
-    const def = (
-      current as {
-        _def?: { innerType?: z.ZodTypeAny; schema?: z.ZodTypeAny; getter?: () => z.ZodTypeAny };
-      }
-    )._def;
-    current = def?.innerType ?? def?.schema ?? def?.getter?.();
+    const def = current.def as {
+      innerType?: z.ZodTypeAny;
+      in?: z.ZodTypeAny;
+      getter?: () => z.ZodTypeAny;
+    };
+    current = def.innerType ?? def.in ?? def.getter?.();
   }
   return null;
 }
 
 // SDK validation hands the handler the PARSED value, and strip-mode objects silently
-// drop unknown keys - passthrough keeps whatever the client sent
+// drop unknown keys - loose keeps whatever the client sent. Memoized so every HTTP
+// request gets the same schema object, and its JSON Schema conversion stays cached.
+const lenientBodySchemas = new WeakMap<z.ZodTypeAny, z.ZodTypeAny>();
 function lenientBodySchema(schema: z.ZodTypeAny): z.ZodTypeAny {
+  let lenient = lenientBodySchemas.get(schema);
+  if (!lenient) {
+    lenient = buildLenientBodySchema(schema);
+    lenientBodySchemas.set(schema, lenient);
+  }
+  return lenient;
+}
+
+function buildLenientBodySchema(schema: z.ZodTypeAny): z.ZodTypeAny {
   if (schema instanceof z.ZodObject) {
-    return schema.passthrough();
+    return schema.loose();
   }
   if (schema instanceof z.ZodOptional) {
-    return lenientBodySchema(schema.unwrap()).optional();
+    return lenientBodySchema(schema.unwrap() as z.ZodTypeAny).optional();
   }
   if (schema instanceof z.ZodNullable) {
-    return lenientBodySchema(schema.unwrap()).nullable();
+    return lenientBodySchema(schema.unwrap() as z.ZodTypeAny).nullable();
   }
   if (schema instanceof z.ZodLazy) {
-    return z.lazy(() => lenientBodySchema(schema.schema));
+    return z.lazy(() => lenientBodySchema(schema.unwrap() as z.ZodTypeAny));
   }
   return schema;
 }
@@ -3472,15 +3532,172 @@ async function executeGraphTool(
  * silently shifting `allowedScopes` or `userFields` into the wrong slot.
  */
 export interface GraphToolRegistrationOptions {
+  eagerTools?: string[];
+  /** Receives unavailable eager selections; hosts can deduplicate diagnostics across requests. */
+  onUnavailableEagerTool?: (name: string) => void;
   readOnly?: boolean;
   enabledTools?: string;
   orgMode?: boolean;
+  appMode?: boolean;
   authManager?: AuthManager;
   multiAccount?: boolean;
   accountNames?: string[];
   allowedScopes?: string;
   httpMode?: boolean;
   userFields?: string;
+}
+
+function registerGraphToolWithMcp(
+  server: McpServer,
+  tool: (typeof allEndpoints)[number],
+  endpointConfig: EndpointConfig | undefined,
+  graphClient: GraphClient,
+  options: GraphToolRegistrationOptions
+): void {
+  const { authManager, multiAccount = false, accountNames = [] } = options;
+  const userFields = parseUserFields(options.userFields);
+  const paramSchema: Record<string, z.ZodTypeAny> = {};
+  if (tool.parameters && tool.parameters.length > 0) {
+    for (const param of tool.parameters) {
+      if (param.type === 'Query') {
+        const schema = queryParameterSchema(param.name, param.schema || z.any(), endpointConfig);
+        if (schema) paramSchema[param.name] = schema;
+        continue;
+      }
+      // Lenient Body validation, or the SDK strips a flattened body value to {} (#569)
+      paramSchema[param.name] =
+        param.type === 'Body' && param.schema
+          ? lenientBodySchema(param.schema as z.ZodTypeAny)
+          : param.schema || z.any();
+    }
+  }
+
+  // Extract path parameters from the path pattern (e.g., :todoTaskListId from /me/todo/lists/:todoTaskListId/tasks)
+  // The generated client omits these from tool.parameters, so we add them manually.
+  const pathParamMatches = tool.path.matchAll(/:([a-zA-Z]+)/g);
+  for (const match of pathParamMatches) {
+    const pathParamName = match[1];
+    if (!(pathParamName in paramSchema)) {
+      paramSchema[pathParamName] = z.string().describe(describePathParam(pathParamName));
+    }
+  }
+
+  // Endpoints with a configured acceptType get a synthetic, optional `Accept` param.
+  // The generated client declares no Accept header anywhere, so without this the
+  // caller has no way to reach the alternate representation of the resource — the
+  // configured default would be the only value the server can ever send.
+  if (endpointConfig?.acceptType && paramSchema['Accept'] === undefined) {
+    paramSchema['Accept'] = z
+      .string()
+      .optional()
+      .describe(getAcceptParamDescription(endpointConfig.acceptType));
+  }
+
+  if (endpointConfig?.blobOutput && paramSchema['fileName'] === undefined) {
+    paramSchema['fileName'] = z
+      .string()
+      .optional()
+      .describe(
+        'Name of the file, used as the last segment of the returned resource URI when the server runs with blob output. Optional.'
+      );
+  }
+
+  if (isFetchAllPagesApplicable(tool)) {
+    const maxPages = getMaxPages();
+    paramSchema['fetchAllPages'] = z
+      .boolean()
+      .optional()
+      .describe(getFetchAllPagesParamDescription(maxPages, endpointConfig));
+  }
+
+  if (endpointConfig?.nameFilter) {
+    paramSchema['name'] = z.string().optional().describe(MEMBER_NAME_PARAM_DESCRIPTION);
+  }
+
+  if (isSkiptokenApplicable(tool, Object.keys(paramSchema), endpointConfig)) {
+    paramSchema['skiptoken'] = z.string().optional().describe(SKIPTOKEN_PARAM_DESCRIPTION);
+  }
+
+  // Add account parameter for multi-account mode.
+  // Layer 2: Account names are surfaced in the description (not as a strict enum) so the LLM
+  // sees available accounts upfront without a round-trip, but accounts added mid-session via
+  // --login are still accepted — getTokenForAccount() handles validation at runtime.
+  if (multiAccount) {
+    paramSchema['account'] = z
+      .string()
+      .optional()
+      .describe(getAccountParamDescription(accountNames));
+  }
+
+  // Add includeHeaders parameter for all tools to capture ETags and other headers
+  paramSchema['includeHeaders'] = z
+    .boolean()
+    .optional()
+    .describe('Include response headers (including ETag) in the response metadata');
+
+  // Add excludeResponse parameter to only return success/failure indication
+  paramSchema['excludeResponse'] = z
+    .boolean()
+    .optional()
+    .describe('Exclude the full response body and only return success or failure indication');
+
+  // Destructive tools (POST except readOnly, PATCH, PUT, DELETE) require an
+  // explicit `confirm: true` server-side gate. See isDestructiveOperation +
+  // executeGraphTool for the enforcement; surface the param in the schema so
+  // the LLM/agent sees it upfront.
+  const destructive = isDestructiveOperation(tool.method, endpointConfig);
+  if (destructive) {
+    paramSchema['confirm'] = z.boolean().optional().describe(CONFIRM_PARAM_DESCRIPTION);
+  }
+
+  // Add timezone parameter for calendar endpoints that support it
+  if (endpointConfig?.supportsTimezone) {
+    paramSchema['timezone'] = z.string().optional().describe(TIMEZONE_PARAM_DESCRIPTION);
+  }
+
+  // Add expandExtendedProperties parameter for calendar endpoints that support it
+  if (endpointConfig?.supportsExpandExtendedProperties) {
+    paramSchema['expandExtendedProperties'] = z
+      .boolean()
+      .optional()
+      .describe(EXPAND_EXTENDED_PROPERTIES_PARAM_DESCRIPTION);
+  }
+
+  // Build the tool description, optionally appending LLM tips
+  let toolDescription = withApiVersionPrefix(
+    (endpointConfig?.descriptionOverride ?? tool.description) ||
+      `Execute ${tool.method.toUpperCase()} request to ${tool.path}`,
+    endpointConfig
+  );
+  if (endpointConfig?.llmTip) {
+    toolDescription += `\n\n💡 TIP: ${endpointConfig.llmTip}`;
+  }
+
+  // An endpoint marked readOnly in endpoints.json (e.g. a POST query like
+  // copilot-retrieve) is a read-only operation despite its write verb, so derive
+  // the hints from that flag rather than the HTTP method alone — otherwise a
+  // read-only query lands as destructiveHint:true and clients mis-rank it.
+  const isReadOnlyTool = tool.method.toUpperCase() === 'GET' || endpointConfig?.readOnly === true;
+
+  // .loose() object, not a raw shape - the SDK wraps raw shapes in z.object()
+  // and strips unknown keys before the handler runs, which is exactly how #569's
+  // flattened subject/toRecipients got lost
+  server.registerTool(
+    tool.alias,
+    {
+      title: tool.alias,
+      description: toolDescription,
+      inputSchema: z.object(paramSchema).loose(),
+      annotations: {
+        title: tool.alias,
+        readOnlyHint: isReadOnlyTool,
+        destructiveHint: destructive,
+        openWorldHint: true, // All tools call Microsoft Graph API
+      },
+    },
+    async (params: Record<string, unknown>) =>
+      executeGraphTool(tool, endpointConfig, graphClient, params, authManager, userFields)
+  );
 }
 
 export function registerGraphTools(
@@ -3492,6 +3709,7 @@ export function registerGraphTools(
     readOnly = false,
     enabledTools: enabledToolsPattern,
     orgMode = false,
+    appMode = false,
     authManager,
     multiAccount = false,
     accountNames = [],
@@ -3515,9 +3733,10 @@ export function registerGraphTools(
   let failedCount = 0;
   const allowedScopes = parseAllowedScopes(allowedScopesValue);
   const disabledByAllowedScopes: DisabledToolScope[] = [];
+  const scopeMode = scopeModeFor({ orgMode, appMode });
   const deniedTools = collectDeniedToolPolicies({
     readOnly,
-    orgMode,
+    scopeMode,
     enabledToolsRegex,
     allowedScopesValue,
     httpMode,
@@ -3525,8 +3744,8 @@ export function registerGraphTools(
 
   for (const tool of allEndpoints) {
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
-    if (!orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
-      logger.info(`Skipping work account tool ${tool.alias} - not in org mode`);
+    if (!isEndpointInScopeMode(endpointConfig, scopeMode)) {
+      logger.info(`Skipping tool ${tool.alias} - not available in ${scopeMode} mode`);
       skippedCount++;
       continue;
     }
@@ -3553,7 +3772,7 @@ export function registerGraphTools(
       allowedScopes !== undefined && !endpointConfig
         ? ['endpoint scope metadata']
         : getMissingAllowedScopesForGroups(
-            getEndpointScopeGroups(endpointConfig, orgMode),
+            getEndpointScopeGroups(endpointConfig, scopeMode),
             allowedScopes
           );
     if (missingScopes.length > 0) {
@@ -3562,149 +3781,8 @@ export function registerGraphTools(
       continue;
     }
 
-    const paramSchema: Record<string, z.ZodTypeAny> = {};
-    if (tool.parameters && tool.parameters.length > 0) {
-      for (const param of tool.parameters) {
-        if (param.type === 'Query') {
-          const schema = queryParameterSchema(param.name, param.schema || z.any(), endpointConfig);
-          if (schema) paramSchema[param.name] = schema;
-          continue;
-        }
-        // Lenient Body validation, or the SDK strips a flattened body value to {} (#569)
-        paramSchema[param.name] =
-          param.type === 'Body' && param.schema
-            ? lenientBodySchema(param.schema as z.ZodTypeAny)
-            : param.schema || z.any();
-      }
-    }
-
-    // Extract path parameters from the path pattern (e.g., :todoTaskListId from /me/todo/lists/:todoTaskListId/tasks)
-    // The generated client omits these from tool.parameters, so we add them manually.
-    const pathParamMatches = tool.path.matchAll(/:([a-zA-Z]+)/g);
-    for (const match of pathParamMatches) {
-      const pathParamName = match[1];
-      if (!(pathParamName in paramSchema)) {
-        paramSchema[pathParamName] = z.string().describe(describePathParam(pathParamName));
-      }
-    }
-
-    // Endpoints with a configured acceptType get a synthetic, optional `Accept` param.
-    // The generated client declares no Accept header anywhere, so without this the
-    // caller has no way to reach the alternate representation of the resource — the
-    // configured default would be the only value the server can ever send.
-    if (endpointConfig?.acceptType && paramSchema['Accept'] === undefined) {
-      paramSchema['Accept'] = z
-        .string()
-        .describe(getAcceptParamDescription(endpointConfig.acceptType))
-        .optional();
-    }
-
-    if (endpointConfig?.blobOutput && paramSchema['fileName'] === undefined) {
-      paramSchema['fileName'] = z
-        .string()
-        .describe(
-          'Name of the file, used as the last segment of the returned resource URI when the server runs with blob output. Optional.'
-        )
-        .optional();
-    }
-
-    if (isFetchAllPagesApplicable(tool)) {
-      const maxPages = getMaxPages();
-      paramSchema['fetchAllPages'] = z
-        .boolean()
-        .describe(getFetchAllPagesParamDescription(maxPages, endpointConfig))
-        .optional();
-    }
-
-    if (endpointConfig?.nameFilter) {
-      paramSchema['name'] = z.string().describe(MEMBER_NAME_PARAM_DESCRIPTION).optional();
-    }
-
-    if (isSkiptokenApplicable(tool, Object.keys(paramSchema), endpointConfig)) {
-      paramSchema['skiptoken'] = z.string().describe(SKIPTOKEN_PARAM_DESCRIPTION).optional();
-    }
-
-    // Add account parameter for multi-account mode.
-    // Layer 2: Account names are surfaced in the description (not as a strict enum) so the LLM
-    // sees available accounts upfront without a round-trip, but accounts added mid-session via
-    // --login are still accepted — getTokenForAccount() handles validation at runtime.
-    if (multiAccount) {
-      paramSchema['account'] = z
-        .string()
-        .describe(getAccountParamDescription(accountNames))
-        .optional();
-    }
-
-    // Add includeHeaders parameter for all tools to capture ETags and other headers
-    paramSchema['includeHeaders'] = z
-      .boolean()
-      .describe('Include response headers (including ETag) in the response metadata')
-      .optional();
-
-    // Add excludeResponse parameter to only return success/failure indication
-    paramSchema['excludeResponse'] = z
-      .boolean()
-      .describe('Exclude the full response body and only return success or failure indication')
-      .optional();
-
-    // Destructive tools (POST except readOnly, PATCH, PUT, DELETE) require an
-    // explicit `confirm: true` server-side gate. See isDestructiveOperation +
-    // executeGraphTool for the enforcement; surface the param in the schema so
-    // the LLM/agent sees it upfront.
-    const destructive = isDestructiveOperation(tool.method, endpointConfig);
-    if (destructive) {
-      paramSchema['confirm'] = z.boolean().describe(CONFIRM_PARAM_DESCRIPTION).optional();
-    }
-
-    // Add timezone parameter for calendar endpoints that support it
-    if (endpointConfig?.supportsTimezone) {
-      paramSchema['timezone'] = z.string().describe(TIMEZONE_PARAM_DESCRIPTION).optional();
-    }
-
-    // Add expandExtendedProperties parameter for calendar endpoints that support it
-    if (endpointConfig?.supportsExpandExtendedProperties) {
-      paramSchema['expandExtendedProperties'] = z
-        .boolean()
-        .describe(EXPAND_EXTENDED_PROPERTIES_PARAM_DESCRIPTION)
-        .optional();
-    }
-
-    // Build the tool description, optionally appending LLM tips
-    let toolDescription = withApiVersionPrefix(
-      (endpointConfig?.descriptionOverride ?? tool.description) ||
-        `Execute ${tool.method.toUpperCase()} request to ${tool.path}`,
-      endpointConfig
-    );
-    if (endpointConfig?.llmTip) {
-      toolDescription += `\n\n💡 TIP: ${endpointConfig.llmTip}`;
-    }
-
-    // An endpoint marked readOnly in endpoints.json (e.g. a POST query like
-    // copilot-retrieve) is a read-only operation despite its write verb, so derive
-    // the hints from that flag rather than the HTTP method alone — otherwise a
-    // read-only query lands as destructiveHint:true and clients mis-rank it.
-    const isReadOnlyTool = tool.method.toUpperCase() === 'GET' || endpointConfig?.readOnly === true;
-
     try {
-      // .passthrough() object, not a raw shape - the SDK wraps raw shapes in z.object()
-      // and strips unknown keys before the handler runs, which is exactly how #569's
-      // flattened subject/toRecipients got lost
-      server.registerTool(
-        tool.alias,
-        {
-          title: tool.alias,
-          description: toolDescription,
-          inputSchema: z.object(paramSchema).passthrough(),
-          annotations: {
-            title: tool.alias,
-            readOnlyHint: isReadOnlyTool,
-            destructiveHint: destructive,
-            openWorldHint: true, // All tools call Microsoft Graph API
-          },
-        },
-        async (params: Record<string, unknown>) =>
-          executeGraphTool(tool, endpointConfig, graphClient, params, authManager, userFields)
-      );
+      registerGraphToolWithMcp(server, tool, endpointConfig, graphClient, options);
       registeredCount++;
     } catch (error) {
       logger.error(`Failed to register tool ${tool.alias}: ${(error as Error).message}`);
@@ -3730,9 +3808,7 @@ export function registerGraphTools(
     userFields,
   };
   for (const utility of UTILITY_TOOLS) {
-    if (readOnly && !utility.readOnlyHint) continue;
-    if (httpMode && utility.stdioOnly) continue;
-    if (utility.enabled && !utility.enabled()) continue;
+    if (!isUtilityToolAvailable(utility, { readOnly, httpMode, scopeMode })) continue;
     if (enabledToolsRegex && !enabledToolsRegex.test(utility.name)) continue;
     try {
       registerUtilityToolWithMcp(server, utility, utilityCtx);
@@ -3755,7 +3831,7 @@ export function registerGraphTools(
 
 export function buildToolsRegistry(
   readOnly: boolean,
-  orgMode: boolean,
+  mode: boolean | ScopeMode,
   enabledToolsRegex?: RegExp,
   allowedScopesValue?: string,
   disabledByAllowedScopes: Array<{ toolName: string; missingScopes: string[] }> = []
@@ -3769,7 +3845,7 @@ export function buildToolsRegistry(
   for (const tool of allEndpoints) {
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
 
-    if (!orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
+    if (!isEndpointInScopeMode(endpointConfig, mode)) {
       continue;
     }
 
@@ -3788,7 +3864,7 @@ export function buildToolsRegistry(
       allowedScopes !== undefined && !endpointConfig
         ? ['endpoint scope metadata']
         : getMissingAllowedScopesForGroups(
-            getEndpointScopeGroups(endpointConfig, orgMode),
+            getEndpointScopeGroups(endpointConfig, mode),
             allowedScopes
           );
     if (missingScopes.length > 0) {
@@ -3900,6 +3976,16 @@ export function scoreDiscoveryQuery(
   return ranked;
 }
 
+/** Validate configured names before HTTP listeners start; retained at registration for direct callers. */
+export function validateEagerToolNames(names: readonly string[]): void {
+  const knownNames = new Set([
+    ...allEndpoints.map((t) => t.alias),
+    ...UTILITY_TOOLS.map((t) => t.name),
+  ]);
+  const unknown = names.filter((name) => !knownNames.has(name));
+  if (unknown.length > 0) throw new Error(`Unknown eager tool names: ${unknown.join(', ')}`);
+}
+
 export function registerDiscoveryTools(
   server: McpServer,
   graphClient: GraphClient,
@@ -3909,6 +3995,7 @@ export function registerDiscoveryTools(
     readOnly = false,
     enabledTools,
     orgMode = false,
+    appMode = false,
     authManager,
     multiAccount = false,
     accountNames = [],
@@ -3916,6 +4003,8 @@ export function registerDiscoveryTools(
     httpMode = false,
     userFields: userFieldsValue,
   } = options;
+  const eagerNames = new Set(options.eagerTools ?? []);
+  validateEagerToolNames([...eagerNames]);
   const userFields = parseUserFields(userFieldsValue);
   let enabledToolsRegex: RegExp | undefined;
   if (enabledTools) {
@@ -3930,16 +4019,17 @@ export function registerDiscoveryTools(
   }
 
   const disabledByAllowedScopes: Array<{ toolName: string; missingScopes: string[] }> = [];
+  const scopeMode = scopeModeFor({ orgMode, appMode });
   const deniedTools = collectDeniedToolPolicies({
     readOnly,
-    orgMode,
+    scopeMode,
     enabledToolsRegex,
     allowedScopesValue,
     httpMode,
   });
   const toolsRegistry = buildToolsRegistry(
     readOnly,
-    orgMode,
+    scopeMode,
     enabledToolsRegex,
     allowedScopesValue,
     disabledByAllowedScopes
@@ -3950,12 +4040,36 @@ export function registerDiscoveryTools(
     );
   }
   const utilityTools = UTILITY_TOOLS.filter((u) => {
-    if (readOnly && !u.readOnlyHint) return false;
-    if (httpMode && u.stdioOnly) return false;
-    if (u.enabled && !u.enabled()) return false;
+    if (!isUtilityToolAvailable(u, { readOnly, httpMode, scopeMode })) return false;
     if (enabledToolsRegex && !enabledToolsRegex.test(u.name)) return false;
     return true;
   });
+  // Eager selection changes presentation only. The discovery catalogue remains complete,
+  // and the existing availability filters run before either execution path is exposed.
+  for (const name of eagerNames) {
+    try {
+      const entry = toolsRegistry.get(name);
+      if (entry) {
+        registerGraphToolWithMcp(server, entry.tool, entry.config, graphClient, options);
+        continue;
+      }
+      const utility = utilityTools.find((tool) => tool.name === name);
+      if (utility) {
+        registerUtilityToolWithMcp(server, utility, {
+          graphClient,
+          authManager,
+          multiAccount,
+          accountNames,
+          userFields,
+        });
+        continue;
+      }
+      if (options.onUnavailableEagerTool) options.onUnavailableEagerTool(name);
+      else logger.info(`Eager tool ${name} is unavailable under the current filters or transport`);
+    } catch (error) {
+      logger.error(`Failed to register eager tool ${name}: ${(error as Error).message}`);
+    }
+  }
   const searchIndex = buildDiscoverySearchIndex(toolsRegistry, utilityTools);
   const totalCount = toolsRegistry.size + utilityTools.length;
   logger.info(
@@ -4007,12 +4121,12 @@ export function registerDiscoveryTools(
     {
       query: z
         .string()
+        .optional()
         .describe(
           'Natural-language query. Tokenized and BM25-ranked. E.g. "send email", "download photo", "list unread messages".'
-        )
-        .optional(),
-      category: z.string().describe(`Optional pre-filter by category: ${categoryNames}`).optional(),
-      limit: z.number().describe('Maximum results (default: 10, max: 50)').optional(),
+        ),
+      category: z.string().optional().describe(`Optional pre-filter by category: ${categoryNames}`),
+      limit: z.number().optional().describe('Maximum results (default: 10, max: 50)'),
     },
     {
       title: 'search-tools',
@@ -4103,11 +4217,11 @@ export function registerDiscoveryTools(
     {
       tool_name: z.string().describe('Name of the tool to execute (e.g., "list-mail-messages")'),
       parameters: z
-        .record(z.any())
+        .record(z.string(), z.any())
+        .optional()
         .describe(
           'Parameters shaped per get-tool-schema. Path/query/header params go at the top level; request bodies go under "body".'
-        )
-        .optional(),
+        ),
     },
     {
       title: 'execute-tool',

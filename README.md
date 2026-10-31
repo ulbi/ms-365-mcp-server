@@ -155,7 +155,7 @@ The `--list-permissions` JSON includes:
 
 ### Allowed Scopes
 
-By default, MSAL requests the scopes implied by the enabled tools, and the tool surface is controlled by `--enabled-tools`, `--preset`, `--org-mode`, and `--read-only`.
+By default, MSAL requests the scopes implied by the enabled tools, and the tool surface is controlled by `--enabled-tools`, `--enabled-tools-file`, `--preset`, `--org-mode`, and `--read-only`.
 
 Enterprise and headless deployments can add a scope boundary with `--allowed-scopes` or `MS365_MCP_ALLOWED_SCOPES`. When configured, the server first computes the normal tool surface, then hides Graph tools whose required scopes are not covered by the allowlist. OAuth metadata and login flows request only the effective permissions for the tools that remain enabled.
 
@@ -164,6 +164,19 @@ npx @softeria/ms-365-mcp-server \
   --org-mode \
   --enabled-tools '^(list-mail-messages|get-mail-message|list-drives|get-drive-item|download-bytes)$' \
   --allowed-scopes 'User.Read Mail.Read Files.Read'
+```
+
+For longer filters, put one regex per line in a file and pass `--enabled-tools-file` / `ENABLED_TOOLS_FILE`. Blank lines and whole-line `#` comments are dropped; the rest are joined with `|`, so the file is equivalent to `--enabled-tools=line1|line2|…`:
+
+```text
+# tools.txt
+^list-mail-messages$
+^get-mail-message$
+drive|download-bytes
+```
+
+```bash
+npx @softeria/ms-365-mcp-server --org-mode --enabled-tools-file ./tools.txt
 ```
 
 CLI value takes precedence over `MS365_MCP_ALLOWED_SCOPES`; if neither is set, the default tool-derived scope behavior is unchanged. Supplying an empty value fails at startup so deployments do not accidentally fall back to a wider tool surface.
@@ -557,6 +570,61 @@ This method:
 - Use your pre-existing OAuth token for Microsoft Graph API requests
 - Does not handle token refresh (token lifecycle management is your responsibility)
 
+#### 4. App Mode (application permissions, no signed-in user)
+
+> **Warning**: application permissions apply to the whole tenant. `Mail.Read` granted to the app reads every
+> mailbox, `Files.ReadWrite.All` writes every OneDrive and site, and whoever can call this server acts with
+> them. Grant the fewest permissions you can. To limit which mailboxes and calendars it reaches, grant the
+> mail and calendar permissions with
+> [RBAC for Applications in Exchange Online](https://learn.microsoft.com/en-us/exchange/permissions-exo/application-rbac)
+> **instead of** in Microsoft Entra: the two add up, so an Entra `Mail.Read` grant left in place still reaches
+> every mailbox. SharePoint sites can be narrowed with `Sites.Selected`.
+
+For unattended agents that act as the app registration itself (client credentials):
+
+```bash
+MS365_MCP_CLIENT_ID=<your app id> \
+MS365_MCP_TENANT_ID=<your tenant id or domain> \
+MS365_MCP_CLIENT_SECRET=<secret> \
+npx @softeria/ms-365-mcp-server --app-mode --read-only
+```
+
+- Use your own app registration with **application** permissions and admin consent, and set exactly one
+  credential:
+  - `MS365_MCP_CLIENT_SECRET`
+  - `MS365_MCP_CLIENT_CERTIFICATE_PATH`: a PEM file with the certificate and its unencrypted private key
+  - `MS365_MCP_FEDERATED_TOKEN_FILE`: a token from an identity provider the app trusts through
+    [workload identity federation](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation),
+    read again on every token request. On AKS set it to `$AZURE_FEDERATED_TOKEN_FILE`, which Kubernetes
+    keeps fresh. A GitHub Actions OIDC token is valid for 5 minutes, so writing it to a file once only
+    covers the first Graph token (about an hour) unless something rewrites the file. If Entra answers
+    `AADSTS700213`, set the federated credential's subject to the one quoted in the error (GitHub's
+    subject can include the owner and repo ids).
+
+  `MS365_MCP_TENANT_ID` must be a real tenant, not `common`.
+
+- On an Azure host (App Service, Container Apps, VM, ...) set `MS365_MCP_MANAGED_IDENTITY=system`, or the
+  client id of a user-assigned identity, instead. No app registration, tenant id or secret is needed, and
+  Key Vault (`MS365_MCP_KEYVAULT_URL`) is not read. Graph
+  application permissions for a managed identity can't be granted in the portal;
+  [assign them with PowerShell or the Graph API](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-assign-app-role-managed-identity).
+  On Azure Container Instances, give the container one kind of identity: with both a system- and a
+  user-assigned identity, the system-assigned token request fails there.
+- Tokens are renewed automatically. Nothing is cached on disk.
+- Only tools that work with application permissions are offered: the `/users/{user-id}` mail and calendar
+  tools (pass a UPN or object id as `user-id`), users and groups, OneDrive/SharePoint drives and lists, Planner,
+  Teams reads, presence, places and subscriptions. `/me` tools, Excel, OneNote and sending Teams chat or channel
+  messages are not available, because Graph does not support them with application permissions.
+- `--list-permissions --app-mode` lists the application permissions the offered tools use. `--allowed-scopes`,
+  `--enabled-tools`, `--preset` and `--read-only` narrow the surface as usual.
+- `--verify-login --app-mode` gets a token and shows the app id, tenant and granted roles (Exchange RBAC
+  grants do not show up there).
+- The `mail`, `calendar` and `outlook` presets are built from `/me` tools and leave little in app mode; the
+  `/users/{user-id}` mail and calendar tools are in `work`.
+- stdio only. It refuses `--http`, `--obo`, `--extra-scopes`, `MS365_MCP_OAUTH_TOKEN` and the
+  login/account options.
+- Webinar tools also need an application access policy assigned to the organizer.
+
 > **Note**: HTTP mode requires authentication. For unauthenticated testing, use stdio mode with device code flow.
 >
 > **Authentication Tools**: In HTTP mode, login/logout tools are disabled by default since OAuth handles authentication.
@@ -636,6 +704,8 @@ npx @softeria/ms-365-mcp-server --list-presets  # See all available presets
 
 Available presets: `mail`, `calendar`, `files`, `personal`, `work`, `excel`, `contacts`, `tasks`, `onenote`, `search`, `users`, `outlook`, `onedrive`, `teams`, `teams-write`, `all`
 
+See **[PRESETS.md](PRESETS.md)** for the full list of tools each preset unlocks (regenerated on `npm run generate`).
+
 Each endpoint in `endpoints.json` declares which presets it belongs to via a `presets` array, so every preset is an exact tool-name allow-list that never over-matches across apps (e.g. `mail` does not include shared-mailbox tools; those are in `work`). The universal binary reader `download-bytes` is included in every preset except `teams-write`, so whatever an app returns (a file, an attachment, a photo, a recording) can always be fetched; `get-download-url` (a pre-authenticated URL for drive/SharePoint files) rides with the drive-backed presets, and joins every other preset (bar `teams-write`) when HTTP mode runs with `--enable-attachment-urls`. So a preset that can find a file can always read its bytes.
 
 The `outlook`, `onedrive` and `teams` presets are app-scoped: they expose exactly one Microsoft app. Use these for "expose exactly one app" deployments:
@@ -664,6 +734,34 @@ npx @softeria/ms-365-mcp-server --discovery
 
 Keeps the initial context small and cuts token usage, especially useful for long sessions or cost-sensitive setups (e.g. Open WebUI running against a paid API).
 
+### Hybrid discovery with direct tools
+
+Keep the full enabled catalogue discoverable while exposing frequent operations directly:
+
+```bash
+npx @softeria/ms-365-mcp-server --org-mode --discovery \
+  --eager-tools list-mail-messages,get-calendar-view,download-bytes
+```
+
+`--eager-tools` accepts comma-separated **exact** Graph or utility tool names,
+not a regular expression or preset. `MS365_MCP_EAGER_TOOLS` is the environment
+fallback; the CLI wins. An empty or whitespace-only environment value is treated
+as unset, including without discovery; an explicitly empty CLI option is still
+invalid. The option requires `--discovery`. Empty entries and
+unknown names fail startup, including in HTTP mode. Duplicate names are registered once.
+
+Direct tools use the same schemas, annotations and execution handlers as normal
+mode. They also remain searchable and executable through discovery. Existing
+`--preset`, `--enabled-tools`, `--allowed-scopes`, `--read-only`, organization-mode
+and transport restrictions apply first: an eager selection cannot enable a
+filtered-out tool or add permissions. Recognized but unavailable tools are
+omitted with a diagnostic logged once per server instance. HTTP still excludes
+server-local file tools.
+
+Select a small set: exposing many generated Graph schemas can consume substantial
+model context. This option does not shrink individual schemas. Without
+`--eager-tools`, discovery and normal registration behave as before.
+
 ## CLI Options
 
 The following options can be used when running ms-365-mcp-server directly from the command line:
@@ -672,7 +770,7 @@ The following options can be used when running ms-365-mcp-server directly from t
 --login           Login using device code flow
 --logout          Log out and clear saved credentials
 --verify-login    Verify login without starting the server
---list-permissions List required Graph API permissions and exit (respects --org-mode, --preset, --enabled-tools, --allowed-scopes)
+--list-permissions List required Graph API permissions and exit (respects --org-mode, --preset, --enabled-tools, --enabled-tools-file, --allowed-scopes)
 --org-mode        Enable organization/work mode from start (includes Teams, SharePoint, etc.)
 --work-mode       Alias for --org-mode
 --force-work-scopes Backwards compatibility alias for --org-mode (deprecated)
@@ -702,6 +800,8 @@ When running as an MCP server, the following options can be used:
                   which reads files from those directories.
                   Refused unless --http binds a loopback host with no --public-url and no
                   --trust-proxy-auth
+--app-mode        Use application permissions (client credentials) with no signed-in user. stdio only
+                  (see "App Mode" under Authentication)
 --enable-auth-tools Enable login/logout tools when using HTTP mode (disabled by default in HTTP mode)
 --enable-attachment-urls Let get-download-url mint a server-served URL for byte resources Graph
                   exposes no pre-authenticated URL for (see "Server-Minted Attachment URLs").
@@ -715,6 +815,9 @@ When running as an MCP server, the following options can be used:
                   (requires --attachment-port; see "Splitting the attachment listener")
 --no-dynamic-registration Disable OAuth Dynamic Client Registration (enabled by default in HTTP mode)
 --enabled-tools <pattern> Filter tools using regex pattern (e.g., "excel|contact" to enable Excel and Contact tools)
+--enabled-tools-file <path> Filter tools using a file with one regex per line (same as --enabled-tools;
+                  blank lines and whole-line # comments ignored). Overrides --enabled-tools;
+                  overridden by --preset. Equivalent env var: ENABLED_TOOLS_FILE
 --preset <names>  Use preset tool categories (comma-separated). See "Tool Presets" section above
 --list-presets    List all available presets and exit
 --toon            (experimental) Enable TOON output format for 30-60% token reduction
@@ -728,8 +831,13 @@ Environment variables:
 
 - `READ_ONLY=true|1`: Alternative to --read-only flag
 - `ENABLED_TOOLS`: Filter tools using a regex pattern (alternative to --enabled-tools flag)
+- `ENABLED_TOOLS_FILE`: Path to a file with one regex per line (alternative to --enabled-tools-file). Blank lines and whole-line `#` comments are dropped, then lines are joined with `|` (same as `ENABLED_TOOLS=line1|line2|…`). Layering (later wins): `--enabled-tools` → `--enabled-tools-file` → `--preset` → `ENABLED_TOOLS` → `ENABLED_TOOLS_FILE`
 - `MS365_MCP_ORG_MODE=true|1`: Enable organization/work mode (alternative to --org-mode flag)
 - `MS365_MCP_FORCE_WORK_SCOPES=true|1`: Backwards compatibility for MS365_MCP_ORG_MODE
+- `MS365_MCP_APP_MODE=true|1`: Enable app mode (alternative to --app-mode flag)
+- `MS365_MCP_CLIENT_CERTIFICATE_PATH=<path>`: PEM file with a certificate and its unencrypted private key, used instead of `MS365_MCP_CLIENT_SECRET` in app mode
+- `MS365_MCP_FEDERATED_TOKEN_FILE=<path>`: Federated token (workload identity federation), used instead of a secret or certificate in app mode
+- `MS365_MCP_MANAGED_IDENTITY=system|<client id>`: Use the host's managed identity in app mode, instead of an app registration
 - `MS365_MCP_OUTPUT_FORMAT=toon`: Enable TOON output format (alternative to --toon flag)
 - `MS365_MCP_MAX_TOP=<n>`: Hard cap for Graph `$top` / `top` on list requests (positive integer). When the model passes a larger value, the server clamps it to `n` so responses stay smaller. Example: `MS365_MCP_MAX_TOP=15`
 - `MS365_MCP_MAX_PAGES=<n>`: Maximum number of pages followed when a tool is called with `fetchAllPages: true` (positive integer, default `100`). Bounds memory and latency for large result sets.

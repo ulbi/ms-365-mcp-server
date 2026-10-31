@@ -21,7 +21,11 @@ import type { CommandOptions } from './cli.ts';
 import { getCloudEndpoints } from './cloud-config.js';
 import { dumpError } from './crash-logging.js';
 import GraphClient from './graph-client.js';
-import { registerDiscoveryTools, registerGraphTools } from './graph-tools.js';
+import {
+  registerDiscoveryTools,
+  registerGraphTools,
+  validateEagerToolNames,
+} from './graph-tools.js';
 import { configureAttachmentMinting } from './lib/attachment-minting.js';
 import { AttachmentTicketStore } from './lib/attachment-tickets.js';
 import { ATTACHMENT_ROUTE, loadAttachmentUrlConfig } from './lib/attachment-url-config.js';
@@ -283,8 +287,16 @@ class MicrosoftGraphServer {
 
   // Two-leg PKCE: stores client's code_challenge and server's code_verifier, keyed by OAuth state
   private pkceStore: Map<string, PkceEntry> = new Map();
+  private reportedUnavailableEagerTools = new Set<string>();
+
+  private reportUnavailableEagerTool = (name: string): void => {
+    if (this.reportedUnavailableEagerTools.has(name)) return;
+    this.reportedUnavailableEagerTools.add(name);
+    logger.info(`Eager tool ${name} is unavailable under the current filters or transport`);
+  };
 
   constructor(authManager: AuthManager, options: CommandOptions = {}) {
+    if (options.eagerTools?.length) validateEagerToolNames(options.eagerTools);
     this.authManager = authManager;
     this.options = options;
     this.graphClient = null; // Initialized in start() after secrets are loaded
@@ -316,22 +328,29 @@ class MicrosoftGraphServer {
       {
         instructions: buildMcpServerInstructions({
           discovery: Boolean(this.options.discovery),
+          eagerTools: this.options.eagerTools,
           orgMode: Boolean(this.options.orgMode),
+          appMode: Boolean(this.options.appMode),
           readOnly: Boolean(this.options.readOnly),
           multiAccount: this.multiAccount,
         }),
       }
     );
 
-    const shouldRegisterAuthTools = !this.options.http || this.options.enableAuthTools;
+    // App mode has no accounts to log in to, list or switch between
+    const shouldRegisterAuthTools =
+      !this.options.appMode && (!this.options.http || this.options.enableAuthTools);
     if (shouldRegisterAuthTools) {
       registerAuthTools(server, this.authManager);
     }
 
     const registrationOptions = {
       readOnly: this.options.readOnly,
+      eagerTools: this.options.eagerTools,
+      onUnavailableEagerTool: this.reportUnavailableEagerTool,
       enabledTools: this.options.enabledTools,
       orgMode: this.options.orgMode,
+      appMode: this.options.appMode,
       authManager: this.authManager,
       multiAccount: this.multiAccount,
       accountNames: this.accountNames,
@@ -368,7 +387,8 @@ class MicrosoftGraphServer {
   }
 
   async initialize(version: string): Promise<void> {
-    this.secrets = await getSecrets();
+    // A managed identity must not fall back to Key Vault or the built-in client id here
+    this.secrets = this.authManager.getAppSecrets?.() ?? (await getSecrets());
     this.version = version;
 
     // Detect multi-account mode and cache account names for schema enum.
